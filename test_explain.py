@@ -13,11 +13,15 @@ from explain_commit import (
     GitRepo,
     sanitize_and_truncate_diff,
     is_lockfile_or_generated,
+    is_binary_file,
+    resolve_file_path,
     build_prompt,
+    build_file_prompt,
     get_backend,
     OfflineBackend,
     write_cache,
-    read_cache
+    read_cache,
+    MarkdownTerminalRenderer
 )
 
 class TestGitExplain(unittest.TestCase):
@@ -149,12 +153,71 @@ class TestGitExplain(unittest.TestCase):
         self.assertIn("app.py", prompt)
         self.assertIn("def run(): pass", prompt)
 
+    def test_resolve_file_path(self):
+        repo = GitRepo(self.local_dir)
+        sub_dir = os.path.join(self.local_dir, "src")
+        os.makedirs(sub_dir, exist_ok=True)
+        test_file = os.path.join(sub_dir, "auth.py")
+        with open(test_file, "w") as f:
+            f.write("def login(): pass\n")
+
+        # Resolve direct
+        resolved = resolve_file_path(test_file, repo)
+        self.assertEqual(resolved, os.path.realpath(test_file))
+
+        # Resolve relative to repo root
+        resolved_rel = resolve_file_path("src/auth.py", repo)
+        self.assertEqual(resolved_rel, os.path.realpath(test_file))
+
+        # Non-existent
+        self.assertIsNone(resolve_file_path("non_existent.py", repo))
+
+    def test_build_file_prompt(self):
+        code = "def authenticate(user, password):\n    return True\n"
+        prompt = build_file_prompt("auth.py", code, detail_level="normal")
+        self.assertIn("auth.py", prompt)
+        self.assertIn("authenticate", prompt)
+        self.assertIn("Functions & Classes", prompt)
+
+    def test_binary_file_check(self):
+        text_file = os.path.join(self.temp_dir, "text.txt")
+        with open(text_file, "w") as f:
+            f.write("hello world\n")
+        self.assertFalse(is_binary_file(text_file))
+
+        bin_file = os.path.join(self.temp_dir, "binary.bin")
+        with open(bin_file, "wb") as f:
+            f.write(b"\x00\x01\x02\x03\xff")
+        self.assertTrue(is_binary_file(bin_file))
+
     def test_caching(self):
         test_key = "test_cache_key_12345"
         test_val = "This is cached content"
         write_cache(test_key, test_val)
         cached = read_cache(test_key)
         self.assertEqual(cached, test_val)
+
+    def test_markdown_renderer_bold_and_code(self):
+        renderer = MarkdownTerminalRenderer(raw=False)
+        rendered = renderer.render_line("- **cheese** is `good`.")
+        self.assertNotIn("**cheese**", rendered)
+        self.assertNotIn("`good`", rendered)
+        self.assertIn("cheese", rendered)
+        self.assertIn("good", rendered)
+        self.assertIn("\033[1m", rendered)  # ANSI Bold
+        self.assertIn("\033[38;5;51m", rendered)  # ANSI Cyan
+
+    def test_markdown_renderer_links(self):
+        renderer = MarkdownTerminalRenderer(raw=False)
+        rendered = renderer.render_line("Added [math_calc.py](file:///some/long/path/to/math_calc.py).")
+        self.assertNotIn("file://", rendered)
+        self.assertIn("math_calc.py", rendered)
+
+    def test_markdown_renderer_raw_mode(self):
+        renderer = MarkdownTerminalRenderer(raw=True)
+        raw_text = "- **cheese** is `good`."
+        rendered = renderer.render_line(raw_text)
+        self.assertEqual(rendered, raw_text)
 
     def test_offline_backend(self):
         backend = get_backend("offline")

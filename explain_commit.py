@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
 git-explain / explain-commit
-A fast, intelligent CLI tool that uses AI to explain code changes in real time:
+A fast, intelligent CLI tool that uses AI to explain code changes and source files in real time:
   - Commits you are about to push (ahead of remote)
   - Changes that haven't been committed yet (staged/unstaged)
   - The latest pushed or HEAD commit
   - Any specific commit hash or branch range
+  - Any specific source file in the codebase (--file / -f)
 """
 
 import argparse
@@ -20,7 +21,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from typing import Callable, Dict, Generator, List, Optional, Tuple
+from typing import Dict, Generator, List, Optional, Tuple, Union
 
 # ANSI color codes
 class Colors:
@@ -51,6 +52,107 @@ def style(text: str, *styles: str, raw: bool = False) -> str:
         return text
     return "".join(styles) + text + Colors.RESET
 
+
+class MarkdownTerminalRenderer:
+    """
+    Renders Markdown syntax into crisp ANSI terminal formatting.
+    Converts **bold** into real terminal bold, `code` into cyan highlights,
+    # headers into styled titles, bullets into dots, and strips URI clutter.
+    """
+    def __init__(self, raw: bool = False):
+        self.raw = raw or not sys.stdout.isatty() or bool(os.environ.get("NO_COLOR", False))
+        self.in_code_block = False
+
+    def render_line(self, line: str) -> str:
+        if self.raw:
+            return line
+
+        # Code block fences: ```python or ```
+        if line.strip().startswith("```"):
+            self.in_code_block = not self.in_code_block
+            if self.in_code_block:
+                lang = line.strip()[3:].strip()
+                tag = f" {lang} " if lang else ""
+                return f"{Colors.GRAY}┌──{tag}{'─' * max(5, 42 - len(tag))}{Colors.RESET}"
+            else:
+                return f"{Colors.GRAY}└──{'─' * 42}{Colors.RESET}"
+
+        if self.in_code_block:
+            return f"{Colors.GRAY}│{Colors.RESET} {Colors.CYAN}{line}{Colors.RESET}"
+
+        # Headers
+        if line.startswith("# "):
+            return f"\n{Colors.BOLD}{Colors.CYAN}{Colors.UNDERLINE}{line[2:].strip()}{Colors.RESET}\n"
+        elif line.startswith("## "):
+            return f"\n{Colors.BOLD}{Colors.BLUE}{line[3:].strip()}{Colors.RESET}"
+        elif line.startswith("### "):
+            return f"\n{Colors.BOLD}{Colors.WHITE}{line[4:].strip()}{Colors.RESET}"
+        elif line.startswith("#### "):
+            return f"\n{Colors.BOLD}{Colors.YELLOW}{line[5:].strip()}{Colors.RESET}"
+
+        # Horizontal rules
+        if line.strip() in ("---", "___", "***"):
+            return f"{Colors.GRAY}{'─' * 50}{Colors.RESET}"
+
+        # Blockquote
+        if line.startswith("> "):
+            return f"  {Colors.PURPLE}│{Colors.RESET} {Colors.ITALIC}{self._format_inline(line[2:])}{Colors.RESET}"
+
+        # Bullet lists (- or *)
+        if re.match(r"^(\s*)[-*]\s+", line):
+            m = re.match(r"^(\s*)[-*]\s+(.*)", line)
+            indent = m.group(1)
+            content = self._format_inline(m.group(2))
+            return f"{indent}  {Colors.PURPLE}•{Colors.RESET} {content}"
+
+        # Numbered lists (1. or 2.)
+        if re.match(r"^(\s*)\d+\.\s+", line):
+            m = re.match(r"^(\s*)(\d+\.)\s+(.*)", line)
+            indent = m.group(1)
+            num = f"{Colors.YELLOW}{m.group(2)}{Colors.RESET}"
+            content = self._format_inline(m.group(3))
+            return f"{indent}  {num} {content}"
+
+        # Standard text line
+        return self._format_inline(line)
+
+    def _format_inline(self, text: str) -> str:
+        # Markdown links: [label](url) -> Underlined blue label
+        text = re.sub(
+            r'\[([^\]]+)\]\([^\)]+\)',
+            lambda m: f"{Colors.UNDERLINE}{Colors.BLUE}{m.group(1).replace('`', '')}{Colors.RESET}",
+            text
+        )
+
+        # Bold: **text** or __text__ -> Bold bright white
+        text = re.sub(
+            r'\*\*(.*?)\*\*',
+            lambda m: f"{Colors.BOLD}{Colors.WHITE}{m.group(1)}{Colors.RESET}",
+            text
+        )
+        text = re.sub(
+            r'__(.*?)__',
+            lambda m: f"{Colors.BOLD}{Colors.WHITE}{m.group(1)}{Colors.RESET}",
+            text
+        )
+
+        # Inline code: `code` -> Cyan
+        text = re.sub(
+            r'`([^`]+)`',
+            lambda m: f"{Colors.CYAN}{m.group(1)}{Colors.RESET}",
+            text
+        )
+
+        # Italic: *text* (single asterisk) -> Italic
+        text = re.sub(
+            r'(?<!\*)\*(?!\*)(.*?)(?<!\*)\*(?!\*)',
+            lambda m: f"{Colors.ITALIC}{m.group(1)}{Colors.RESET}",
+            text
+        )
+
+        return text
+
+
 # Cache directory
 CACHE_DIR = os.path.expanduser("~/.cache/git-explain")
 
@@ -78,6 +180,7 @@ def write_cache(cache_key: str, content: str):
     except Exception:
         pass
 
+
 # Lockfiles and generated files to omit or summarize from prompt
 IGNORED_PATTERNS = [
     r"package-lock\.json$",
@@ -100,6 +203,15 @@ def is_lockfile_or_generated(path: str) -> bool:
             return True
     return False
 
+def is_binary_file(filepath: str) -> bool:
+    try:
+        with open(filepath, "rb") as f:
+            chunk = f.read(1024)
+            return b"\0" in chunk
+    except Exception:
+        return True
+
+
 # Real-time Stream Spinner
 class StreamSpinner:
     FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
@@ -118,7 +230,7 @@ class StreamSpinner:
             sys.stdout.write(f"\r{Colors.CYAN}{frame}{Colors.RESET} {style(self.message, Colors.DIM)}")
             sys.stdout.flush()
             time.sleep(0.08)
-        sys.stdout.write("\r\033[K")  # Clear line
+        sys.stdout.write("\r\033[K")
         sys.stdout.flush()
 
     def start(self):
@@ -136,6 +248,7 @@ class StreamSpinner:
             self.thread.join(timeout=0.5)
         sys.stdout.write("\r\033[K")
         sys.stdout.flush()
+
 
 # Git interaction helpers
 class GitRepo:
@@ -339,6 +452,21 @@ class GitRepo:
         return desc, stat, diff
 
 
+def resolve_file_path(path_str: str, repo: Optional[GitRepo] = None) -> Optional[str]:
+    """Resolves a file path relative to cwd or repo root."""
+    if not path_str:
+        return None
+    # 1. As provided relative to cwd / absolute
+    if os.path.isfile(path_str):
+        return os.path.realpath(path_str)
+    # 2. Relative to git repo root
+    if repo and repo.root:
+        candidate = os.path.join(repo.root, path_str)
+        if os.path.isfile(candidate):
+            return os.path.realpath(candidate)
+    return None
+
+
 def sanitize_and_truncate_diff(diff_text: str, max_chars: int = 15_000) -> str:
     """
     Cleans large lockfiles, generated code, and truncates if overly large
@@ -386,8 +514,6 @@ class AgyBackend(BaseBackend):
         self.deep_mode = deep_mode
 
     def explain_stream(self, prompt: str) -> Generator[str, None, None]:
-        # Fast mode: gemini-3.8-flash-low + low reasoning effort
-        # Deep mode: gemini-3.8-flash-high + high reasoning effort
         model = "gemini-3.8-flash-high" if self.deep_mode else "gemini-3.8-flash-low"
         effort = "high" if self.deep_mode else "low"
 
@@ -507,8 +633,8 @@ class OfflineBackend(BaseBackend):
     def explain_stream(self, prompt: str) -> Generator[str, None, None]:
         yield (
             "### ⚠️ Offline Mode\n"
-            "No active AI backend found (agy, Gemini, OpenAI, or Ollama).\n"
-            "Changes were detected in your repository. Please configure an AI backend or check network connection."
+            "- No active AI backend found (agy, Gemini, OpenAI, or Ollama).\n"
+            "- Please verify network connectivity or AI tool configuration."
         )
 
 def get_backend(preferred_backend: Optional[str] = None, deep_mode: bool = False) -> BaseBackend:
@@ -544,7 +670,7 @@ def get_backend(preferred_backend: Optional[str] = None, deep_mode: bool = False
 
 
 def copy_to_clipboard(text: str) -> bool:
-    """Copies text to system clipboard (supports macOS pbcopy, Linux xclip/wl-copy)."""
+    """Copies raw markdown text to system clipboard (supports macOS pbcopy, Linux xclip/wl-copy)."""
     if shutil.which("pbcopy"):
         p = subprocess.Popen(["pbcopy"], stdin=subprocess.PIPE)
         p.communicate(text.encode("utf-8"))
@@ -560,14 +686,13 @@ def copy_to_clipboard(text: str) -> bool:
     return False
 
 
-def build_prompt(
+def build_diff_prompt(
     target_description: str,
     branch: str,
     stat_summary: str,
     diff_text: str,
     detail_level: str = "normal"
 ) -> str:
-    # Optimized concise prompts to minimize token generation time
     detail_instructions = {
         "brief": (
             "Explain in 2-3 concise sentences total: what is the core intent and what code was changed."
@@ -608,15 +733,74 @@ Formatting:
 - Use backticks for code symbols (e.g. `function_name`, `ClassName`).
 """
 
+# Alias for backwards compatibility
+build_prompt = build_diff_prompt
 
-def display_banner(target_desc: str, branch: str, cached: bool = False, raw: bool = False):
+
+def build_file_prompt(
+    file_path: str,
+    file_content: str,
+    detail_level: str = "normal"
+) -> str:
+    """Builds a tailored prompt to explain a codebase file and its functions."""
+    ext = os.path.splitext(file_path)[1].lstrip('.') or ''
+    detail_instructions = {
+        "brief": (
+            "Explain in 2-3 concise sentences: what is the core responsibility of this file and list its main functions/classes."
+        ),
+        "normal": (
+            "Provide a fast, high-signal explanation of this code file and its functions:\n"
+            "- 🎯 **Purpose & Role**: 1-2 direct sentences on what this file does in the project.\n"
+            "- 🧩 **Functions & Classes Breakdown**:\n"
+            "  - For each function / class / method:\n"
+            "    - Role and purpose\n"
+            "    - Key parameters/inputs and return values\n"
+            "    - How the internal logic works\n"
+            "- 🔄 **Data Flow & How It Works**: How data moves through the functions or components in this file.\n"
+            "- 💡 **Usage Example / Quick Tip**: Brief note or example on how this code is used or invoked."
+        ),
+        "detailed": (
+            "Provide an in-depth architectural and code-level walkthrough of this file:\n"
+            "- 🎯 **Architectural Role & System Context**\n"
+            "- 🧩 **Comprehensive Function & Class Breakdown**:\n"
+            "  - Signatures, parameters, and return types\n"
+            "  - Step-by-step logic, algorithms, and key conditionals\n"
+            "  - State management, invariants, and side effects\n"
+            "- ⚠️ **Error Handling, Edge Cases & Potential Pitfalls**\n"
+            "- 🔄 **Dependencies & Data Flow**\n"
+            "- 🧪 **Testing Considerations & Code Examples**"
+        )
+    }.get(detail_level, "normal")
+
+    return f"""You are a principal software engineer. Explain the following source code file and how its functions work clearly for a developer.
+
+File: {file_path}
+
+Source Code:
+```{ext}
+{file_content}
+```
+
+Instructions:
+{detail_instructions}
+
+Formatting:
+- Use Markdown with clear headers and bullet points.
+- Reference functions, classes, and variables with backticks (e.g. `function_name()`, `ClassName`).
+- Be technical, clear, and direct. Skip filler.
+"""
+
+
+def display_banner(target_desc: str, branch: Optional[str] = None, cached: bool = False, raw: bool = False):
     if not is_color_enabled(raw):
         cache_indicator = " [CACHED]" if cached else ""
-        print(f"=== Explaining: {target_desc} (branch: {branch}){cache_indicator} ===")
+        branch_str = f" (branch: {branch})" if branch else ""
+        print(f"=== Explaining: {target_desc}{branch_str}{cache_indicator} ===")
         return
 
     cache_badge = f" {style('⚡ CACHED', Colors.GREEN)} " if cached else ""
-    banner_text = f" 💡 {target_desc} [{branch}]{cache_badge} "
+    branch_badge = f" [{branch}]" if branch else ""
+    banner_text = f" 💡 {target_desc}{branch_badge}{cache_badge} "
     box_width = max(len(re.sub(r'\033\[[0-9;]*m', '', banner_text)) + 2, 45)
     border = "═" * box_width
     print(f"\n{Colors.BLUE}╔{border}╗{Colors.RESET}")
@@ -624,33 +808,36 @@ def display_banner(target_desc: str, branch: str, cached: bool = False, raw: boo
     print(f"{Colors.BLUE}╚{border}╝{Colors.RESET}\n")
 
 
-def interactive_menu(repo: GitRepo) -> str:
-    status = repo.get_status_summary()
-    unpushed = repo.get_unpushed_commits()
-    latest = repo.get_latest_commit()
-
+def interactive_menu(repo: Optional[GitRepo]) -> Union[str, Tuple[str, str]]:
     options = []
     
-    if status["has_uncommitted"]:
-        n_staged = len(status["staged"])
-        n_unstaged = len(status["unstaged"])
-        n_untracked = len(status["untracked"])
-        desc = f"Uncommitted changes ({n_staged} staged, {n_unstaged} unstaged, {n_untracked} untracked)"
-        options.append(("uncommitted", desc))
-        if n_staged > 0:
-            options.append(("staged", f"Staged changes only ({n_staged} files ready to commit)"))
-    else:
-        options.append(("uncommitted", "Uncommitted changes (working tree is clean)"))
+    if repo:
+        status = repo.get_status_summary()
+        unpushed = repo.get_unpushed_commits()
+        latest = repo.get_latest_commit()
 
-    if unpushed:
-        options.append(("unpushed", f"Commit(s) about to be pushed ({len(unpushed)} commit(s) ahead of remote)"))
-    else:
-        options.append(("unpushed", "Commit(s) about to be pushed (0 unpushed commits)"))
+        if status["has_uncommitted"]:
+            n_staged = len(status["staged"])
+            n_unstaged = len(status["unstaged"])
+            n_untracked = len(status["untracked"])
+            desc = f"Uncommitted changes ({n_staged} staged, {n_unstaged} unstaged, {n_untracked} untracked)"
+            options.append(("uncommitted", desc))
+            if n_staged > 0:
+                options.append(("staged", f"Staged changes only ({n_staged} files ready to commit)"))
+        else:
+            options.append(("uncommitted", "Uncommitted changes (working tree is clean)"))
 
-    if latest:
-        options.append(("latest", f"Latest commit (HEAD: {latest[0]} '{latest[1]}')"))
+        if unpushed:
+            options.append(("unpushed", f"Commit(s) about to be pushed ({len(unpushed)} commit(s) ahead of remote)"))
+        else:
+            options.append(("unpushed", "Commit(s) about to be pushed (0 unpushed commits)"))
 
-    options.append(("pick", "Select from recent commit history"))
+        if latest:
+            options.append(("latest", f"Latest commit (HEAD: {latest[0]} '{latest[1]}')"))
+
+        options.append(("pick", "Select from recent commit history"))
+
+    options.append(("file", "Explain a specific file and its functions"))
 
     print(f"\n{style('? What would you like to explain?', Colors.BOLD, Colors.CYAN)}\n")
     for i, (_, label) in enumerate(options, 1):
@@ -665,7 +852,15 @@ def interactive_menu(repo: GitRepo) -> str:
             idx = int(choice) - 1
             if 0 <= idx < len(options):
                 chosen_key = options[idx][0]
-                if chosen_key == "pick":
+                if chosen_key == "file":
+                    fpath = input(f"\n{style('Enter file path (e.g. src/auth.py): ', Colors.BOLD)}").strip()
+                    resolved = resolve_file_path(fpath, repo)
+                    if not resolved:
+                        print(f"{style('Error:', Colors.RED)} File '{fpath}' not found.")
+                        continue
+                    return ("file", resolved)
+
+                if chosen_key == "pick" and repo:
                     recent = repo.get_recent_commits(limit=10)
                     print(f"\n{style('Select a commit from history:', Colors.BOLD, Colors.CYAN)}")
                     for r_idx, (chash, cmsg) in enumerate(recent, 1):
@@ -681,7 +876,7 @@ def interactive_menu(repo: GitRepo) -> str:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Fast AI explanation for git commits, unpushed changes, or uncommitted modifications.",
+        description="Fast AI explanation for git commits, unpushed changes, uncommitted modifications, or codebase files.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -689,9 +884,11 @@ Examples:
   git explain --push           # Explain commits you are about to push
   git explain --latest         # Explain the latest commit (HEAD)
   git explain --uncommitted    # Explain uncommitted working directory changes
+  git explain -f src/auth.py   # Explain how a specific file and its functions work
+  git explain src/auth.py      # Positional file path auto-detected
   git explain -i               # Interactive menu to select what to explain
   git explain --deep           # Deep reasoning mode with high thinking effort
-  git explain --copy           # Explain and automatically copy to clipboard
+  git explain --copy           # Explain and automatically copy clean markdown to clipboard
   git explain --brief          # Ultra-fast 2-sentence summary
         """
     )
@@ -701,7 +898,7 @@ Examples:
         "target",
         nargs="?",
         default=None,
-        help="Optional target: 'uncommitted', 'staged', 'push', 'latest', or a git ref/range"
+        help="Optional target: 'uncommitted', 'staged', 'push', 'latest', a file path, or a git ref/range"
     )
 
     # Target flags
@@ -710,6 +907,7 @@ Examples:
     target_group.add_argument("-s", "--staged", action="store_true", help="Explain only staged (cached) changes")
     target_group.add_argument("-p", "--push", "--unpushed", action="store_true", dest="unpushed", help="Explain commit(s) about to be pushed")
     target_group.add_argument("-l", "--latest", "--last", "--head", action="store_true", help="Explain latest commit (HEAD)")
+    target_group.add_argument("-f", "--file", type=str, default=None, help="Explain the code, classes, and functions inside a specific file")
     target_group.add_argument("-i", "--interactive", action="store_true", help="Interactively choose what to explain")
 
     # Speed & Depth Options
@@ -726,22 +924,43 @@ Examples:
 
     args = parser.parse_args()
 
+    repo = None
     try:
         repo = GitRepo()
     except Exception as e:
-        print(f"{style('Error:', Colors.BOLD, Colors.RED)} {e}", file=sys.stderr)
-        sys.exit(1)
+        # Check if user passed --file or a file path directly (which doesn't require git)
+        candidate = args.file or (args.target if args.target and os.path.isfile(args.target) else None)
+        if not candidate:
+            print(f"{style('Error:', Colors.BOLD, Colors.RED)} {e}", file=sys.stderr)
+            sys.exit(1)
 
-    branch = repo.get_current_branch()
-    status = repo.get_status_summary()
-    unpushed_commits = repo.get_unpushed_commits()
+    branch = repo.get_current_branch() if repo else None
+    status = repo.get_status_summary() if repo else {"has_uncommitted": False, "staged": [], "unstaged": [], "untracked": []}
+    unpushed_commits = repo.get_unpushed_commits() if repo else []
 
     # Determine target mode
     mode = None
     ref_arg = None
+    file_target = None
 
-    if args.interactive:
-        mode = interactive_menu(repo)
+    if args.file:
+        resolved = resolve_file_path(args.file, repo)
+        if not resolved:
+            print(f"{style('Error:', Colors.BOLD, Colors.RED)} File '{args.file}' not found.", file=sys.stderr)
+            sys.exit(1)
+        mode = "file"
+        file_target = resolved
+    elif args.interactive:
+        res = interactive_menu(repo)
+        if isinstance(res, tuple) and res[0] == "file":
+            mode = "file"
+            file_target = res[1]
+        elif isinstance(res, str):
+            if res in ("uncommitted", "staged", "unpushed", "latest"):
+                mode = res
+            else:
+                mode = "custom_ref"
+                ref_arg = res
     elif args.staged:
         mode = "staged"
     elif args.uncommitted:
@@ -761,95 +980,138 @@ Examples:
         elif t in ("latest", "last", "head"):
             mode = "latest"
         else:
-            mode = "custom_ref"
-            ref_arg = args.target
+            # Check if positional target is an existing file
+            resolved = resolve_file_path(args.target, repo)
+            if resolved:
+                mode = "file"
+                file_target = resolved
+            else:
+                mode = "custom_ref"
+                ref_arg = args.target
     else:
         # Smart Auto-Detection
         if status["has_uncommitted"]:
             mode = "uncommitted"
         elif unpushed_commits:
             mode = "unpushed"
-        elif repo.has_commits():
+        elif repo and repo.has_commits():
             mode = "latest"
         else:
             print(f"{style('Info:', Colors.YELLOW)} Repository has no commits or changes to explain.", file=sys.stderr)
             sys.exit(0)
 
-    # Gather diff and metadata
-    target_desc = ""
-    stat_summary = ""
-    diff_text = ""
-
-    if mode == "uncommitted":
-        n_staged = len(status["staged"])
-        n_unstaged = len(status["unstaged"])
-        n_untracked = len(status["untracked"])
-        target_desc = f"Uncommitted changes ({n_staged} staged, {n_unstaged} unstaged, {n_untracked} untracked)"
-        stat_summary, diff_text = repo.get_uncommitted_diff(staged_only=False)
-        if not diff_text.strip():
-            print(f"{style('Notice:', Colors.YELLOW)} No uncommitted changes found in working tree.")
-            sys.exit(0)
-
-    elif mode == "staged":
-        target_desc = f"Staged changes ({len(status['staged'])} files staged)"
-        stat_summary, diff_text = repo.get_uncommitted_diff(staged_only=True)
-        if not diff_text.strip():
-            print(f"{style('Notice:', Colors.YELLOW)} No staged changes found. Use 'git add' or run 'git explain -u' for unstaged changes.")
-            sys.exit(0)
-
-    elif mode == "unpushed":
-        if not unpushed_commits:
-            print(f"{style('Notice:', Colors.YELLOW)} No unpushed commits found ahead of remote. Explaining latest commit instead.\n")
-            mode = "latest"
-        else:
-            first_hash, first_msg = unpushed_commits[0]
-            target_desc = f"Commits about to be pushed ({len(unpushed_commits)} commit(s): {first_hash} '{first_msg}')"
-            _, stat_summary, diff_text = repo.get_unpushed_diff()
-
-    if mode == "latest":
-        latest = repo.get_latest_commit()
-        if not latest:
-            print(f"{style('Error:', Colors.RED)} No commits exist in this repository.", file=sys.stderr)
-            sys.exit(1)
-        target_desc = f"Latest commit ({latest[0]}: '{latest[1]}')"
-        _, stat_summary, diff_text = repo.get_commit_diff("HEAD")
-
-    elif mode == "custom_ref":
-        target_desc, stat_summary, diff_text = repo.get_commit_diff(ref_arg)
-
-    # Sanitize and truncate diff (max 15k chars for fast processing)
-    sanitized_diff = sanitize_and_truncate_diff(diff_text, max_chars=20_000 if args.detailed else 12_000)
-    if not sanitized_diff.strip():
-        print(f"{style('Notice:', Colors.YELLOW)} Diff is empty for the selected target.")
-        sys.exit(0)
-
+    # Process Target
     detail_level = "brief" if args.brief else ("detailed" if args.detailed else "normal")
+    target_desc = ""
+    prompt = ""
+    cache_seed = ""
 
-    # Cache check for instant response
-    cache_seed = f"{target_desc}:{sanitized_diff}:{detail_level}:{args.deep}:{args.backend}"
+    if mode == "file":
+        if is_binary_file(file_target):
+            print(f"{style('Error:', Colors.BOLD, Colors.RED)} '{file_target}' appears to be a binary file. Cannot explain.", file=sys.stderr)
+            sys.exit(1)
+
+        try:
+            with open(file_target, "r", encoding="utf-8", errors="replace") as f:
+                file_content = f.read()
+        except Exception as e:
+            print(f"{style('Error:', Colors.BOLD, Colors.RED)} Could not read file '{file_target}': {e}", file=sys.stderr)
+            sys.exit(1)
+
+        if not file_content.strip():
+            print(f"{style('Notice:', Colors.YELLOW)} File '{file_target}' is empty.")
+            sys.exit(0)
+
+        # Truncate if exceedingly large
+        max_file_chars = 35_000 if args.detailed else 20_000
+        if len(file_content) > max_file_chars:
+            file_content = file_content[:max_file_chars] + f"\n\n# ... [File truncated to {max_file_chars} characters for fast analysis] ..."
+
+        display_name = os.path.relpath(file_target, repo.root if repo else os.getcwd())
+        line_count = len(file_content.splitlines())
+        target_desc = f"File: {display_name} ({line_count} lines)"
+
+        prompt = build_file_prompt(
+            file_path=display_name,
+            file_content=file_content,
+            detail_level=detail_level
+        )
+        cache_seed = f"file:{display_name}:{file_content}:{detail_level}:{args.deep}:{args.backend}"
+
+    else:
+        # Diff-based modes
+        stat_summary = ""
+        diff_text = ""
+
+        if mode == "uncommitted":
+            n_staged = len(status["staged"])
+            n_unstaged = len(status["unstaged"])
+            n_untracked = len(status["untracked"])
+            target_desc = f"Uncommitted changes ({n_staged} staged, {n_unstaged} unstaged, {n_untracked} untracked)"
+            stat_summary, diff_text = repo.get_uncommitted_diff(staged_only=False)
+            if not diff_text.strip():
+                print(f"{style('Notice:', Colors.YELLOW)} No uncommitted changes found in working tree.")
+                sys.exit(0)
+
+        elif mode == "staged":
+            target_desc = f"Staged changes ({len(status['staged'])} files staged)"
+            stat_summary, diff_text = repo.get_uncommitted_diff(staged_only=True)
+            if not diff_text.strip():
+                print(f"{style('Notice:', Colors.YELLOW)} No staged changes found. Use 'git add' or run 'git explain -u' for unstaged changes.")
+                sys.exit(0)
+
+        elif mode == "unpushed":
+            if not unpushed_commits:
+                print(f"{style('Notice:', Colors.YELLOW)} No unpushed commits found ahead of remote. Explaining latest commit instead.\n")
+                mode = "latest"
+            else:
+                first_hash, first_msg = unpushed_commits[0]
+                target_desc = f"Commits about to be pushed ({len(unpushed_commits)} commit(s): {first_hash} '{first_msg}')"
+                _, stat_summary, diff_text = repo.get_unpushed_diff()
+
+        if mode == "latest":
+            latest = repo.get_latest_commit()
+            if not latest:
+                print(f"{style('Error:', Colors.RED)} No commits exist in this repository.", file=sys.stderr)
+                sys.exit(1)
+            target_desc = f"Latest commit ({latest[0]}: '{latest[1]}')"
+            _, stat_summary, diff_text = repo.get_commit_diff("HEAD")
+
+        elif mode == "custom_ref":
+            target_desc, stat_summary, diff_text = repo.get_commit_diff(ref_arg)
+
+        # Sanitize and truncate diff
+        sanitized_diff = sanitize_and_truncate_diff(diff_text, max_chars=20_000 if args.detailed else 12_000)
+        if not sanitized_diff.strip():
+            print(f"{style('Notice:', Colors.YELLOW)} Diff is empty for the selected target.")
+            sys.exit(0)
+
+        prompt = build_diff_prompt(
+            target_description=target_desc,
+            branch=branch or "HEAD",
+            stat_summary=stat_summary,
+            diff_text=sanitized_diff,
+            detail_level=detail_level
+        )
+        cache_seed = f"diff:{target_desc}:{sanitized_diff}:{detail_level}:{args.deep}:{args.backend}"
+
+    # Cache check
     cache_key = hashlib.sha256(cache_seed.encode("utf-8")).hexdigest()
-
     cached_output = None
     if not args.no_cache:
         cached_output = read_cache(cache_key)
 
+    renderer = MarkdownTerminalRenderer(raw=args.raw)
+
     if cached_output:
         display_banner(target_desc, branch, cached=True, raw=args.raw)
-        print(cached_output)
+        for line in cached_output.splitlines():
+            print(renderer.render_line(line))
         print()
         if args.copy:
             if copy_to_clipboard(cached_output):
                 print(f"{style('✓', Colors.GREEN)} {style('Explanation copied to clipboard!', Colors.DIM)}")
         return
-
-    # Build prompt
-    prompt = build_prompt(
-        target_description=target_desc,
-        branch=branch,
-        stat_summary=stat_summary,
-        diff_text=sanitized_diff,
-        detail_level=detail_level
-    )
 
     display_banner(target_desc, branch, cached=False, raw=args.raw)
 
@@ -859,12 +1121,13 @@ Examples:
         print(f"{style('Backend Error:', Colors.RED)} {e}", file=sys.stderr)
         sys.exit(1)
 
-    # Stream output in real-time
+    # Stream output in real-time with line-by-line markdown formatting
     spinner = StreamSpinner("Thinking...", enabled=not args.raw)
     spinner.start()
 
     accumulated = []
     first_chunk_received = False
+    stream_buffer = ""
 
     try:
         for chunk in backend.explain_stream(prompt):
@@ -873,11 +1136,21 @@ Examples:
                 first_chunk_received = True
 
             accumulated.append(chunk)
-            sys.stdout.write(chunk)
-            sys.stdout.flush()
+            stream_buffer += chunk
+
+            while "\n" in stream_buffer:
+                line, stream_buffer = stream_buffer.split("\n", 1)
+                formatted_line = renderer.render_line(line)
+                sys.stdout.write(formatted_line + "\n")
+                sys.stdout.flush()
 
         if not first_chunk_received:
             spinner.stop()
+
+        if stream_buffer:
+            formatted_line = renderer.render_line(stream_buffer)
+            sys.stdout.write(formatted_line + "\n")
+            sys.stdout.flush()
 
     except Exception as e:
         spinner.stop()
@@ -885,13 +1158,13 @@ Examples:
         sys.exit(1)
 
     full_text = "".join(accumulated).strip()
-    print("\n")
+    print()
 
-    # Save to cache
+    # Save raw markdown to cache
     if full_text:
         write_cache(cache_key, full_text)
 
-    # Clipboard support
+    # Clipboard support: copies raw clean markdown
     if args.copy and full_text:
         if copy_to_clipboard(full_text):
             print(f"{style('✓', Colors.GREEN)} {style('Explanation copied to clipboard!', Colors.DIM)}")

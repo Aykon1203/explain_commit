@@ -1,6 +1,7 @@
 # 🔍 `git-explain` / `explain-commit`
 
-An ultra-fast, intelligent CLI tool that explains code changes using AI in real time. Run a single simple command and get an instant, clear breakdown of:
+An ultra-fast, intelligent CLI tool that explains code changes and source files using AI in real time. Run a single simple command and get an instant, clear breakdown of:
+- **Files in your codebase** (`--file` / `-f`): explains how the file, its classes, and functions work
 - **Commits about to be pushed** (local commits ahead of origin/upstream)
 - **Uncommitted changes** in your working directory (staged, unstaged, and untracked files)
 - **The latest pushed or HEAD commit**
@@ -8,12 +9,13 @@ An ultra-fast, intelligent CLI tool that explains code changes using AI in real 
 
 ---
 
-## ⚡ Speed & Performance Highlights
+## ⚡ Speed & Formatting Highlights
 
-- ⚡ **Real-time Token Streaming**: Output streams live onto your terminal chunk-by-chunk. You see words appearing within seconds rather than waiting for the whole prompt to finish.
-- ⚡ **Fast Low-Latency Model by Default**: Runs on `gemini-3.8-flash-low` with low reasoning effort for maximum speed and minimal token bloat.
-- ⚡ **Instant Caching**: Once an explanation is generated for a commit/diff, subsequent runs on the same state return in **0.01 seconds** (`⚡ CACHED`).
-- ⚡ **Smart Noise Filtering**: Automatically omits lockfiles (`package-lock.json`, `pnpm-lock.yaml`, `yarn.lock`, `Cargo.lock`, etc.) and truncates huge diffs to keep time-to-first-token ultra fast.
+- ⚡ **Real-time Token Streaming**: Words stream onto your terminal live as they are generated.
+- 🎨 **Native Terminal Formatting**: Asterisks are stripped and rendered in real **bold text** (`\033[1m`), `code` in cyan highlights, headers in styled titles, and clean bullet lists.
+- ⚡ **Instant Caching**: Once an explanation is generated for a file or commit, repeat runs return in **0.01 seconds** (`⚡ CACHED`).
+- ⚡ **Fast Low-Latency Model by Default**: Runs on `gemini-3.8-flash-low` with low reasoning effort for maximum speed.
+- ⚡ **Smart Noise Filtering**: Automatically omits lockfiles (`package-lock.json`, `pnpm-lock.yaml`, `yarn.lock`, etc.) to keep token overhead minimal.
 
 ---
 
@@ -27,42 +29,42 @@ git explain
 explain-commit
 ```
 
-### 🧠 Smart Auto-Detection
-
-When run without flags, `git explain` automatically detects your repository's state:
-
-| Repository State | Action Taken |
-| :--- | :--- |
-| **Uncommitted changes present** | Explains modified files in your working directory (staged + unstaged) |
-| **Working tree clean + unpushed commits** | Explains the commit(s) you are about to push to remote |
-| **Working tree clean + all commits pushed** | Explains the most recent commit (`HEAD`) |
-
 ---
 
 ## 🚀 Common Commands
 
-### 1. Explain Changes You Haven't Committed Yet
+### 1. Explain a File and Its Functions (NEW ✨)
+Explain how the code, classes, and functions in a specific codebase file work:
+```bash
+git explain -f src/auth.py
+# or with --file:
+git explain --file src/auth.py
+# or simply pass the file path directly:
+git explain src/auth.py
+```
+
+### 2. Explain Changes You Haven't Committed Yet
 ```bash
 git explain --uncommitted    # or: git explain -u
 git explain --staged         # or: git explain -s (only staged changes)
 ```
 
-### 2. Explain Commit(s) About To Be Pushed
+### 3. Explain Commit(s) About To Be Pushed
 ```bash
 git explain --push           # or: git explain -p
 ```
 *Analyzes all commits on your current branch that haven't been pushed to the remote branch yet.*
 
-### 3. Explain the Latest Commit
+### 4. Explain the Latest Commit
 ```bash
 git explain --latest         # or: git explain -l
 ```
 
-### 4. Interactive Target Picker
+### 5. Interactive Target Picker
 ```bash
 git explain -i               # or: git explain --interactive
 ```
-Displays an interactive menu with change counts:
+Displays an interactive menu with change counts and file selection:
 ```
 ? What would you like to explain?
 
@@ -71,27 +73,28 @@ Displays an interactive menu with change counts:
   [3] Commit(s) about to be pushed (1 commit ahead of origin/main)
   [4] Latest commit (HEAD: a1b2c3d 'feat: add auth')
   [5] Select from recent commit history
+  [6] Explain a specific file and its functions
 ```
 
-### 5. Explain Any Specific Commit or Branch Diff
+### 6. Explain Any Specific Commit or Branch Diff
 ```bash
 git explain a1b2c3d          # Explain a specific commit
 git explain HEAD~1           # Explain the previous commit
 git explain main..feature    # Explain all changes between two branches
 ```
 
-### 6. Copy Explanation to Clipboard
+### 7. Copy Explanation to Clipboard
 ```bash
 git explain --copy           # or: git explain -c
 ```
-Automatically copies the AI explanation to your system clipboard (`pbcopy` on macOS).
+Automatically copies clean raw Markdown to your system clipboard (`pbcopy` on macOS). Perfect for pasting into GitHub PRs, Notion, or Slack.
 
-### 7. Choose Speed / Depth
+### 8. Choose Speed / Depth
 ```bash
 git explain --brief          # or: -b (ultra-fast 2-sentence summary)
-git explain                  # (Default: fast, high-signal 3-point breakdown)
-git explain --detailed       # or: -d (in-depth walkthrough with test recommendations)
-git explain --deep           # Enables high-effort reasoning model for complex architectural reviews
+git explain                  # (Default: fast, high-signal structured breakdown)
+git explain --detailed       # or: -d (in-depth walkthrough with testing recommendations)
+git explain --deep           # Enables high-effort reasoning model for complex codebases
 git explain --no-cache       # Bypasses local cache to force a fresh AI analysis
 ```
 
@@ -100,18 +103,20 @@ git explain --no-cache       # Bypasses local cache to force a fresh AI analysis
 ## 🛠️ Options & Flags Reference
 
 ```
-usage: git explain [-h] [-u] [-s] [-p] [-l] [-i] [-b] [-d] [--deep] [--no-cache]
-                   [-c] [--raw] [-e {agy,gemini,openai,ollama,offline}] [target]
+usage: git explain [-h] [-u] [-s] [-p] [-l] [-f FILE] [-i] [-b] [-d] [--deep]
+                   [--no-cache] [-c] [--raw] [-e {agy,gemini,openai,ollama,offline}]
+                   [target]
 
 Target Selection:
+  -f, --file FILE       Explain code, classes, and functions inside a specific file
   -u, --uncommitted     Explain uncommitted changes in working tree
   -s, --staged          Explain only staged changes
   -p, --push, --unpushed
                         Explain commit(s) about to be pushed
   -l, --latest, --head  Explain latest commit (HEAD)
   -i, --interactive     Interactively choose what to explain
-  [target]              Positional target: 'uncommitted', 'staged', 'push', 'latest',
-                        or commit ref (e.g. HEAD~1, a1b2c3d, main..feature)
+  [target]              Positional target: file path, 'uncommitted', 'staged',
+                        'push', 'latest', or commit ref (e.g. HEAD~1, a1b2c3d)
 
 Performance & Detail:
   -b, --brief           Ultra-fast 2-sentence summary
@@ -120,7 +125,7 @@ Performance & Detail:
   --no-cache            Bypass local cache and regenerate fresh explanation
 
 Options:
-  -c, --copy            Copy the generated explanation to clipboard
+  -c, --copy            Copy the generated clean markdown explanation to clipboard
   --raw                 Output raw markdown (no ANSI colors)
   -e, --backend         AI backend: agy (default), gemini, openai, ollama, offline
 ```
